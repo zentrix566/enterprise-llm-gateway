@@ -1,7 +1,10 @@
 """模型注册表。"""
 
+from app.core import get_settings
 from app.providers.base import ModelProvider
+from app.providers.deepseek import DeepSeekProvider
 from app.providers.mock import MockEchoProvider
+from app.providers.qwen import QwenProvider
 
 
 class ProviderRegistry:
@@ -21,5 +24,46 @@ class ProviderRegistry:
         return list(self._providers.values())
 
 
-provider_registry = ProviderRegistry([MockEchoProvider()])
+def build_providers() -> list[ModelProvider]:
+    """根据本地配置创建可用的模型适配器。"""
 
+    settings = get_settings()
+    providers: list[ModelProvider] = [MockEchoProvider()]
+    if settings.deepseek_api_key is not None:
+        deepseek_api_key = settings.deepseek_api_key.get_secret_value().strip()
+        if deepseek_api_key and deepseek_api_key != "your-api-key-here":
+            deepseek_model_ids = {
+                model_id.strip()
+                for model_id in settings.deepseek_models.split(",")
+                if model_id.strip()
+            }
+            providers.extend(
+                DeepSeekProvider(
+                    model_id=model_id,
+                    api_key=deepseek_api_key,
+                    base_url=settings.deepseek_base_url,
+                )
+                for model_id in sorted(deepseek_model_ids)
+            )
+
+    if settings.qwen_api_key is not None:
+        qwen_api_key = settings.qwen_api_key.get_secret_value().strip()
+        if qwen_api_key and qwen_api_key != "your-api-key-here":
+            qwen_model_ids = {
+                model_id.strip()
+                for model_id in settings.qwen_models.split(",")
+                if model_id.strip()
+            }
+            providers.extend(
+                QwenProvider(
+                    model_id=model_id,
+                    api_key=qwen_api_key,
+                    base_url=settings.qwen_base_url,
+                )
+                for model_id in sorted(qwen_model_ids)
+            )
+
+    return providers
+
+
+provider_registry = ProviderRegistry(build_providers())

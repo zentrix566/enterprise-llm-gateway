@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, status
 from fastapi.responses import StreamingResponse
 
 from app.core import get_settings
-from app.providers.base import ModelProvider
+from app.providers.base import ModelProvider, ProviderRequestError
 from app.providers.registry import provider_registry
 from app.schemas import (
     ChatCompletionChoice,
@@ -126,7 +126,16 @@ async def create_chat_completion(
             media_type="text/event-stream",
         )
 
-    content = await provider.complete(request)
+    try:
+        content = await provider.complete(request)
+    except ProviderRequestError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "provider_request_failed",
+                "message": str(exc),
+            },
+        ) from exc
     prompt_text = "\n".join(message.content for message in request.messages)
     prompt_tokens = estimate_tokens(prompt_text)
     completion_tokens = estimate_tokens(content)
