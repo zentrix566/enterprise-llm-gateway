@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+env/
+.venv/
+
+# 构建产物
+build/
+dist/
+
+# 运行时配置与日志
+.env
+*.log
+
+# Node.js 与前端预留
+node_modules/
+
+# IDE
+.idea/
+.vscode/
+
+# 操作系统
+.DS_Store
+Thumbs.db
+
