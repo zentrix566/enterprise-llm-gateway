@@ -2,7 +2,7 @@
 
 from functools import lru_cache
 
-from pydantic import SecretStr
+from pydantic import Field, SecretStr
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     qwen_api_key: SecretStr | None = None
     qwen_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
     qwen_models: str = "qwen3.7-plus,qwen3.6-flash"
+    usage_db_path: str = ".data/gateway.db"
+    model_pricing_json: str = "{}"
+    gateway_api_keys: SecretStr | None = None
+    rate_limit_per_minute: int = Field(default=60, gt=0)
+    model_fallbacks_json: str = "{}"
 
     model_config = SettingsConfigDict(
         env_file=".env",

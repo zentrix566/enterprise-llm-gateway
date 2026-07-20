@@ -1,0 +1,2 @@
+{"id":"mock-cpu","input":"分析服务器 CPU 告警","expected_contains":["Mock 模型收到"]}
+{"id":"mock-disk","input":"给出磁盘空间排查步骤","expected_contains":["Mock 模型收到"]}
