@@ -89,3 +89,4 @@ def test_metrics_contains_request_counter() -> None:
 
     assert response.status_code == 200
     assert "llm_gateway_requests_total" in response.text
+

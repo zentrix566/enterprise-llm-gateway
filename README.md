@@ -66,7 +66,7 @@ MODEL_FALLBACKS_JSON={"deepseek-v4-pro":["deepseek-v4-flash"]}
 
 调用时通过 `X-API-Key` 或 `Authorization: Bearer <Key>` 传递。未配置 `GATEWAY_API_KEYS` 时，认证默认关闭，便于本地测试。当前无 Redis 也能运行，但内存限流只在单进程有效，重启后计数清零；生产环境应替换为 Redis 限流实现。
 
-`MODEL_FALLBACKS_JSON` 是故障降级配置的预留入口，明天继续完成普通响应和流式响应的统一降级策略。
+`MODEL_FALLBACKS_JSON` 用于配置普通请求和 SSE 流式请求的降级模型，例如 `{"deepseek-v4-pro":["deepseek-v4-flash"]}`。当主模型调用失败时，网关按顺序尝试备用模型，并分别记录失败与成功请求。
 
 启动本地服务：
 
@@ -176,9 +176,15 @@ compose.yaml         本地容器编排配置
 - 明日继续完善主模型失败后的普通/流式统一降级
 - 当前改动已完成本地测试，待明日继续扩展后统一提交
 
+### 2026-07-21（周二）
+
+- 完善普通请求和 SSE 流式请求的模型故障降级，主模型失败后自动尝试备用模型
+- 增加主模型失败、备用模型成功的自动化测试，并按供应商分别记录用量与 Prometheus 指标
+- 修复流式路径重复记录 success 指标的问题
+
 ## 后续计划
 
-- 增加超时重试、熔断和备用模型降级
+- 增加超时重试、熔断和更完整的供应商健康检查
 - 将内存限流替换为 Redis 分布式限流
 - 将 SQLite 账本替换为 PostgreSQL，并接入 OpenTelemetry/Langfuse
 - 扩充中文运维场景模型评测集和人工/LLM Judge 评分

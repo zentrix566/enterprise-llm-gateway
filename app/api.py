@@ -96,6 +96,36 @@ def require_provider_chain(model_id: str) -> list[ModelProvider]:
     return providers
 
 
+def record_provider_error(
+    provider: ModelProvider,
+    *,
+    request_id: str,
+    consumer: str,
+    model: str,
+    started_at: float,
+    prompt_tokens: int,
+) -> None:
+    """记录一次供应商失败尝试，便于区分主模型与降级模型。"""
+
+    latency_ms = round((time.perf_counter() - started_at) * 1000)
+    usage_ledger.record(
+        request_id=request_id,
+        consumer=consumer,
+        provider=provider.owner,
+        model=model,
+        status="error",
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        error_code="provider_request_failed",
+    )
+    metrics.record(
+        provider=provider.owner,
+        model=model,
+        status="error",
+        latency_ms=latency_ms,
+    )
+
+
 @router.get("/health", tags=["系统"])
 async def health() -> dict[str, str]:
     """返回服务健康状态和版本。"""
@@ -136,6 +166,7 @@ async def stream_completion(
     prompt_text = "\n".join(message.content for message in request.messages)
     prompt_tokens = estimate_tokens(prompt_text)
     for provider in providers:
+        provider_started_at = time.perf_counter()
         try:
             async for content in provider.stream(request):
                 response_parts.append(content)
@@ -154,21 +185,13 @@ async def stream_completion(
                 }
                 yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
         except ProviderRequestError:
-            usage_ledger.record(
+            record_provider_error(
+                provider,
                 request_id=request_id,
                 consumer=consumer,
-                provider=provider.owner,
                 model=request.model,
-                status="error",
-                latency_ms=round((time.perf_counter() - started_at) * 1000),
+                started_at=provider_started_at,
                 prompt_tokens=prompt_tokens,
-                error_code="provider_request_failed",
-            )
-            metrics.record(
-                provider=provider.owner,
-                model=request.model,
-                status="error",
-                latency_ms=round((time.perf_counter() - started_at) * 1000),
             )
             if response_parts:
                 raise
@@ -200,12 +223,6 @@ async def stream_completion(
         break
     else:
         raise ProviderRequestError("所有备用模型均调用失败")
-    metrics.record(
-        provider=provider.owner,
-        model=request.model,
-        status="success",
-        latency_ms=round((time.perf_counter() - started_at) * 1000),
-    )
     final_payload = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -251,37 +268,38 @@ async def create_chat_completion(
     started_at = time.perf_counter()
     prompt_text = "\n".join(message.content for message in payload.messages)
     prompt_tokens = estimate_tokens(prompt_text)
-    try:
-        content = await provider.complete(payload)
-    except ProviderRequestError as exc:
-        usage_ledger.record(
-            request_id=request_id,
-            consumer=consumer,
-            provider=provider.owner,
-            model=payload.model,
-            status="error",
-            latency_ms=round((time.perf_counter() - started_at) * 1000),
-            prompt_tokens=prompt_tokens,
-            error_code="provider_request_failed",
-        )
-        metrics.record(
-            provider=provider.owner,
-            model=payload.model,
-            status="error",
-            latency_ms=round((time.perf_counter() - started_at) * 1000),
-        )
+    content = None
+    last_error: ProviderRequestError | None = None
+    selected_provider = provider
+    for candidate in providers:
+        try:
+            content = await candidate.complete(payload)
+            selected_provider = candidate
+            break
+        except ProviderRequestError as exc:
+            last_error = exc
+            record_provider_error(
+                candidate,
+                request_id=request_id,
+                consumer=consumer,
+                model=payload.model,
+                started_at=started_at,
+                prompt_tokens=prompt_tokens,
+            )
+
+    if content is None:
         raise HTTPException(
             status_code=status.HTTP_502_BAD_GATEWAY,
             detail={
                 "code": "provider_request_failed",
-                "message": str(exc),
+                "message": str(last_error or "所有供应商调用失败"),
             },
-        ) from exc
+        ) from last_error
     completion_tokens = estimate_tokens(content)
     usage_ledger.record(
         request_id=request_id,
         consumer=consumer,
-        provider=provider.owner,
+        provider=selected_provider.owner,
         model=payload.model,
         status="success",
         latency_ms=round((time.perf_counter() - started_at) * 1000),
@@ -295,7 +313,7 @@ async def create_chat_completion(
         ),
     )
     metrics.record(
-        provider=provider.owner,
+        provider=selected_provider.owner,
         model=payload.model,
         status="success",
         latency_ms=round((time.perf_counter() - started_at) * 1000),
