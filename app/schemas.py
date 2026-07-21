@@ -70,3 +70,24 @@ class ModelListResponse(BaseModel):
     object: Literal["list"] = "list"
     data: list[ModelInfo]
 
+
+class UsageSummaryItem(BaseModel):
+    """单个供应商模型的用量汇总。"""
+
+    consumer: str
+    provider: str
+    model: str
+    total_calls: int
+    success_calls: int
+    error_calls: int
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+    average_latency_ms: float | None
+    estimated_cost: float | None
+
+
+class UsageSummaryResponse(BaseModel):
+    """网关调用用量汇总响应。"""
+
+    data: list[UsageSummaryItem]

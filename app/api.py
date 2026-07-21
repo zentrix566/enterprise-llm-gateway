@@ -6,11 +6,13 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, HTTPException, status
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, HTTPException, Request, status
+from fastapi.responses import Response, StreamingResponse
 
 from app.core import get_settings
-from app.providers.base import ModelProvider
+from app.limits import InMemoryRateLimiter
+from app.metrics import MetricsCollector
+from app.providers.base import ModelProvider, ProviderRequestError
 from app.providers.registry import provider_registry
 from app.schemas import (
     ChatCompletionChoice,
@@ -20,9 +22,35 @@ from app.schemas import (
     ModelInfo,
     ModelListResponse,
     TokenUsage,
+    UsageSummaryResponse,
 )
+from app.security import get_authenticator
+from app.usage import UsageLedger, estimate_cost
 
 router = APIRouter()
+settings = get_settings()
+usage_ledger = UsageLedger(settings.usage_db_path)
+authenticator = get_authenticator()
+rate_limiter = InMemoryRateLimiter(settings.rate_limit_per_minute)
+metrics = MetricsCollector()
+
+
+def authorize_and_limit(request: Request) -> str:
+    """完成 API Key 认证和本地限流，并返回业务方名称。"""
+
+    consumer = authenticator.authenticate(request)
+    retry_after = rate_limiter.check(consumer)
+    if retry_after is not None:
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail={
+                "code": "rate_limit_exceeded",
+                "message": "请求频率超过当前业务方限制",
+            },
+            headers={"Retry-After": str(int(retry_after))},
+        )
+    request.state.consumer = consumer
+    return consumer
 
 
 def estimate_tokens(text: str) -> int:
@@ -44,6 +72,58 @@ def require_provider(model_id: str) -> ModelProvider:
             },
         )
     return provider
+
+
+def require_provider_chain(model_id: str) -> list[ModelProvider]:
+    """根据配置返回主模型及其备用模型链路。"""
+
+    primary = require_provider(model_id)
+    try:
+        fallback_config = json.loads(get_settings().model_fallbacks_json)
+        fallback_ids = fallback_config.get(model_id, [])
+    except (TypeError, ValueError, json.JSONDecodeError):
+        fallback_ids = []
+
+    if not isinstance(fallback_ids, list):
+        fallback_ids = []
+    providers = [primary]
+    for fallback_id in fallback_ids:
+        if not isinstance(fallback_id, str) or fallback_id == model_id:
+            continue
+        fallback = provider_registry.get(fallback_id)
+        if fallback is not None:
+            providers.append(fallback)
+    return providers
+
+
+def record_provider_error(
+    provider: ModelProvider,
+    *,
+    request_id: str,
+    consumer: str,
+    model: str,
+    started_at: float,
+    prompt_tokens: int,
+) -> None:
+    """记录一次供应商失败尝试，便于区分主模型与降级模型。"""
+
+    latency_ms = round((time.perf_counter() - started_at) * 1000)
+    usage_ledger.record(
+        request_id=request_id,
+        consumer=consumer,
+        provider=provider.owner,
+        model=model,
+        status="error",
+        latency_ms=latency_ms,
+        prompt_tokens=prompt_tokens,
+        error_code="provider_request_failed",
+    )
+    metrics.record(
+        provider=provider.owner,
+        model=model,
+        status="error",
+        latency_ms=latency_ms,
+    )
 
 
 @router.get("/health", tags=["系统"])
@@ -72,29 +152,77 @@ async def list_models() -> ModelListResponse:
 
 
 async def stream_completion(
-    provider: ModelProvider,
+    providers: list[ModelProvider],
     request: ChatCompletionRequest,
     completion_id: str,
     created: int,
+    request_id: str,
+    consumer: str,
 ) -> AsyncIterator[str]:
     """将供应商流式结果转换为 OpenAI 风格的 SSE 事件。"""
 
-    async for content in provider.stream(request):
-        payload = {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": request.model,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {"content": content},
-                    "finish_reason": None,
+    started_at = time.perf_counter()
+    response_parts: list[str] = []
+    prompt_text = "\n".join(message.content for message in request.messages)
+    prompt_tokens = estimate_tokens(prompt_text)
+    for provider in providers:
+        provider_started_at = time.perf_counter()
+        try:
+            async for content in provider.stream(request):
+                response_parts.append(content)
+                chunk_payload = {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": content},
+                            "finish_reason": None,
+                        }
+                    ],
                 }
-            ],
-        }
-        yield f"data: {json.dumps(payload, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps(chunk_payload, ensure_ascii=False)}\n\n"
+        except ProviderRequestError:
+            record_provider_error(
+                provider,
+                request_id=request_id,
+                consumer=consumer,
+                model=request.model,
+                started_at=provider_started_at,
+                prompt_tokens=prompt_tokens,
+            )
+            if response_parts:
+                raise
+            continue
 
+        completion_tokens = estimate_tokens("".join(response_parts))
+        usage_ledger.record(
+            request_id=request_id,
+            consumer=consumer,
+            provider=provider.owner,
+            model=request.model,
+            status="success",
+            latency_ms=round((time.perf_counter() - started_at) * 1000),
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            estimated_cost=estimate_cost(
+                request.model,
+                prompt_tokens,
+                completion_tokens,
+                get_settings().model_pricing_json,
+            ),
+        )
+        metrics.record(
+            provider=provider.owner,
+            model=request.model,
+            status="success",
+            latency_ms=round((time.perf_counter() - started_at) * 1000),
+        )
+        break
+    else:
+        raise ProviderRequestError("所有备用模型均调用失败")
     final_payload = {
         "id": completion_id,
         "object": "chat.completion.chunk",
@@ -112,29 +240,89 @@ async def stream_completion(
     response_model=None,
 )
 async def create_chat_completion(
-    request: ChatCompletionRequest,
+    payload: ChatCompletionRequest,
+    request: Request,
 ) -> ChatCompletionResponse | StreamingResponse:
     """通过统一协议调用指定模型。"""
 
-    provider = require_provider(request.model)
+    providers = require_provider_chain(payload.model)
+    provider = providers[0]
     completion_id = f"chatcmpl-{uuid.uuid4().hex}"
     created = int(time.time())
+    request_id = request.state.request_id
+    consumer = authorize_and_limit(request)
 
-    if request.stream:
+    if payload.stream:
         return StreamingResponse(
-            stream_completion(provider, request, completion_id, created),
+            stream_completion(
+                providers,
+                payload,
+                completion_id,
+                created,
+                request_id,
+                consumer,
+            ),
             media_type="text/event-stream",
         )
 
-    content = await provider.complete(request)
-    prompt_text = "\n".join(message.content for message in request.messages)
+    started_at = time.perf_counter()
+    prompt_text = "\n".join(message.content for message in payload.messages)
     prompt_tokens = estimate_tokens(prompt_text)
+    content = None
+    last_error: ProviderRequestError | None = None
+    selected_provider = provider
+    for candidate in providers:
+        try:
+            content = await candidate.complete(payload)
+            selected_provider = candidate
+            break
+        except ProviderRequestError as exc:
+            last_error = exc
+            record_provider_error(
+                candidate,
+                request_id=request_id,
+                consumer=consumer,
+                model=payload.model,
+                started_at=started_at,
+                prompt_tokens=prompt_tokens,
+            )
+
+    if content is None:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail={
+                "code": "provider_request_failed",
+                "message": str(last_error or "所有供应商调用失败"),
+            },
+        ) from last_error
     completion_tokens = estimate_tokens(content)
+    usage_ledger.record(
+        request_id=request_id,
+        consumer=consumer,
+        provider=selected_provider.owner,
+        model=payload.model,
+        status="success",
+        latency_ms=round((time.perf_counter() - started_at) * 1000),
+        prompt_tokens=prompt_tokens,
+        completion_tokens=completion_tokens,
+        estimated_cost=estimate_cost(
+            payload.model,
+            prompt_tokens,
+            completion_tokens,
+            get_settings().model_pricing_json,
+        ),
+    )
+    metrics.record(
+        provider=selected_provider.owner,
+        model=payload.model,
+        status="success",
+        latency_ms=round((time.perf_counter() - started_at) * 1000),
+    )
 
     return ChatCompletionResponse(
         id=completion_id,
         created=created,
-        model=request.model,
+        model=payload.model,
         choices=[
             ChatCompletionChoice(
                 message=ChatCompletionMessage(content=content),
@@ -146,3 +334,22 @@ async def create_chat_completion(
             total_tokens=prompt_tokens + completion_tokens,
         ),
     )
+
+
+@router.get(
+    "/v1/usage/summary",
+    response_model=UsageSummaryResponse,
+    tags=["用量"],
+)
+async def usage_summary(request: Request) -> UsageSummaryResponse:
+    """按供应商和模型返回调用量、Token 与成本汇总。"""
+
+    authorize_and_limit(request)
+    return UsageSummaryResponse(data=usage_ledger.summary())
+
+
+@router.get("/metrics", tags=["监控"])
+async def metrics_endpoint() -> Response:
+    """返回 Prometheus 文本格式的进程内指标。"""
+
+    return Response(content=metrics.render(), media_type="text/plain")

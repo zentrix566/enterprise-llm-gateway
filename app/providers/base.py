@@ -6,6 +6,10 @@ from collections.abc import AsyncIterator
 from app.schemas import ChatCompletionRequest
 
 
+class ProviderRequestError(RuntimeError):
+    """模型供应商请求失败。"""
+
+
 class ModelProvider(ABC):
     """所有模型供应商必须实现的统一接口。"""
 
@@ -21,4 +25,3 @@ class ModelProvider(ABC):
         """逐段返回模型回答。"""
         if False:
             yield ""
-

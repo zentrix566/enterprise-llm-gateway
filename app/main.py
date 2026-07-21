@@ -21,7 +21,7 @@ async def add_request_id(request: Request, call_next):
     """为每个请求生成或透传关联标识。"""
 
     request_id = request.headers.get("X-Request-ID", uuid.uuid4().hex)
+    request.state.request_id = request_id
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     return response
-

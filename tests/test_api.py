@@ -21,9 +21,11 @@ def test_list_models() -> None:
     response = client.get("/v1/models")
 
     assert response.status_code == 200
-    assert response.json()["data"] == [
-        {"id": "mock-echo", "object": "model", "owned_by": "zentrix566"}
-    ]
+    assert {
+        "id": "mock-echo",
+        "object": "model",
+        "owned_by": "zentrix566",
+    } in response.json()["data"]
 
 
 def test_chat_completion() -> None:
@@ -73,4 +75,18 @@ def test_unknown_model() -> None:
 
     assert response.status_code == 404
     assert response.json()["detail"]["code"] == "model_not_found"
+
+
+def test_usage_summary() -> None:
+    response = client.get("/v1/usage/summary")
+
+    assert response.status_code == 200
+    assert isinstance(response.json()["data"], list)
+
+
+def test_metrics_contains_request_counter() -> None:
+    response = client.get("/metrics")
+
+    assert response.status_code == 200
+    assert "llm_gateway_requests_total" in response.text
 
